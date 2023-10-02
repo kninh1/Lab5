@@ -1,28 +1,256 @@
 ---
-title: ""
-author: ""
+title: "Lab5"
+author: "Katrina Ninh"
 format:
   html:
     embed-resources: true
 ---
 
-## Quarto
-
-Quarto enables you to weave together content and executable code into a finished document. To learn more about Quarto see <https://quarto.org>.
-
-## Running Code
-
-When you click the **Render** button a document will be generated that includes both content and the output of embedded code. You can embed code like this:
+\## Setup in R
 
 ```{r}
-1 + 1
-```
 
-You can add options to executable code like this
+library(dtplyr)
+library(dplyr)
+library(data.table)
+library(R.utils)
+library(leaflet)
+options(warn = -1)
+
+#load met data
+
+if (!file.exists("met_all.gz"))
+  download.file(
+    url = "https://raw.githubusercontent.com/USCbiostats/data-science-data/master/02_met/met_all.gz",
+    destfile = "met_all.gz",
+    method   = "libcurl",
+    timeout  = 60
+    )
+met <- data.table::fread("met_all.gz")
+
+met <- met[!is.na(elev) & !is.na(temp)]
+
+summary(met)
+nrow(met)
+
+
+```
 
 ```{r}
-#| echo: false
-2 * 2
+
+#download csv data 
+
+stations <- fread("ftp://ftp.ncdc.noaa.gov/pub/data/noaa/isd-history.csv")
+stations[, USAF := as.integer(USAF)]
+
+# Handles 999999 and NAs
+stations[, USAF   := fifelse(USAF == 999999, NA_integer_, USAF)]
+stations[, CTRY   := fifelse(CTRY == "", NA_character_, CTRY)]
+stations[, STATE  := fifelse(STATE == "", NA_character_, STATE)]
+
+# Selecting the three relevant columns, and keeping unique records
+stations <- unique(stations[, list(USAF, CTRY, STATE)])
+
+# Getting rids of NAs
+stations <- stations[!is.na(USAF)]
+
+# Removing dups
+stations[, n := 1:.N, by = .(USAF)]
+stations <- stations[n == 1,][, n := NULL]
+
+
+head(stations, n = 3)
+head(met, n = 3)
+summary(stations)
+nrow(met)
+nrow(stations)
+
+
 ```
 
-The `echo: false` option disables the printing of code (only output is displayed).
+```{r}
+
+#merge data keep all X, part of Y by doing left join
+
+datMerged <- left_join(
+  x = met,
+  y = stations,
+  by = c("USAFID" = "USAF")
+)
+
+head(datMerged[, list(USAFID, WBAN, STATE)], n = 3)
+
+
+nrow(datMerged)
+colnames(datMerged)
+
+
+```
+
+```{r}
+
+##Question 1: Representative station for the US
+
+##What is the median station in terms of temperature, wind speed, and atmospheric ##pressure? 
+
+medianStation <- datMerged %>%
+  summarize(
+    temp = quantile(temp, probs = 0.5, na.rm = TRUE),
+    windSpeed = quantile(wind.sp, probs = 0.5, na.rm = TRUE),
+    atmPressure = quantile(atm.press, probs = 0.5, na.rm = TRUE)
+  )
+medianStation
+
+```
+
+The median station temperature, wind speed, and atmospheric pressure are 23.5C, 2.1, and 1014.1 respectively.
+
+```{r}
+##Look for the three weather stations that best represent continental US using the ##quantile() function. Do these three coincide?
+
+repStation <- subset (datMerged, temp == medianStation$temp 
+                      & wind.sp == medianStation$windSpeed 
+                      & abs(atm.press - medianStation$atmPressure) <= 0.5,
+                      select = c("USAFID", "CTRY", "STATE", "temp", "wind.sp", "atm.press"))
+
+nrow(repStation)
+repStation
+
+
+
+```
+
+I would pick the following three weather stations to represent continental US - one from a different state
+
+4: 722246 US FL 23.5 2.1 1014.1
+
+6: 722576 US TX 23.5 2.1 1013.7
+
+9: 724467 US MO 23.5 2.1 1013.8
+
+#4, 722246 US FL 23.5 2.1 1014.1 matches exactly the median temperature, wind speed and atm pressure
+
+```{r}
+
+##Question 2: Representative station per state
+
+##Just like the previous question, you are asked to identify what is the most representative, the median, station per ##state. 
+
+##This time, instead of looking at one variable at a time, look at the euclidean distance. If multiple stations show ##in the median, select the one located at the lowest latitude.
+
+
+repByState <- datMerged %>%
+  group_by(STATE) %>%
+  mutate(
+    euclid = sqrt((temp - median(temp, na.rm = TRUE))^2 +
+                              (wind.sp - median(wind.sp, na.rm = TRUE))^2 +
+                              (atm.press - median(atm.press, na.rm = TRUE))^2)
+  ) %>%
+  arrange(euclid, lat) %>%
+  filter(row_number() == 1) %>%
+  select(STATE, USAFID, lat, lon, temp, wind.sp, atm.press)
+
+print(repByState, n=48)
+
+
+```
+
+```{r}
+
+##Question 3: In the middle?
+
+##For each state, identify what is the station that is closest to the mid-point of the state. 
+##Combining these with the stations you identified in the previous question, use leaflet() to visualize all ~100 ##points in the same figure, 
+##applying different colors for those identified in this question.
+
+stateMidpoints <- datMerged[, .(MidLat = mean(lat, na.rm = TRUE),
+                                   MidLon = mean(lon, na.rm = TRUE)),
+                               by = STATE]
+datMerged[, latMidPoint := mean(lat, na.rm = TRUE), by = STATE]
+datMerged[, lonMidPoint := mean(lon, na.rm = TRUE), by = STATE]
+datMerged[, distToMidpoint := sqrt((lat - latMidPoint)^2 + (lon - lonMidPoint)^2)]
+
+closestMidpoint <- datMerged[, .SD[which.min(distToMidpoint)],
+                                         by = STATE]
+
+map <- leaflet() %>%
+  addTiles()
+
+map <- map %>%
+  addCircleMarkers(
+    data = stateMidpoints,
+    lat = ~MidLat,
+    lng = ~MidLon,
+    radius = 3,
+    color = "blue",
+    fillOpacity = 0.8,
+    popup = ~STATE
+  )
+
+# Plot stations identified in this question with a different color
+map <- map %>%
+  addCircleMarkers(
+    data = closestMidpoint,
+    lat = ~lat,
+    lng = ~lon,
+    radius = 3,
+    color = "red",
+    popup = ~USAFID
+  )
+
+# Display the map
+map
+
+
+
+
+```
+
+```{r}
+
+##Question 4: Means of means
+
+##Using the quantile() function, generate a summary table that shows the number of states included, average ##temperature, wind-speed, and atmospheric pressure by the variable “average temperature level,” which you’ll need to ##create.
+
+##Start by computing the states' average temperature. Use that measurement to classify them according to the following ##criteria:
+##•	low: temp < 20
+##•	Mid: temp >= 20 and temp < 25
+##•	High: temp >= 25
+
+##Once you are done with that, you can compute the following:
+##•	Number of entries (records),
+##•	Number of NA entries,
+##•	Number of stations,
+##•	Number of states included, and
+##•	Mean temperature, wind-speed, and atmospheric pressure.
+
+
+stateAvgTemp <- datMerged %>%
+  group_by(STATE) %>%
+  summarize(avgTemp = mean(temp, na.rm = TRUE))
+stateAvgTemp <- stateAvgTemp %>%
+  mutate(
+    classification = case_when(
+      avgTemp < 20 ~ "Low",
+      avgTemp >= 20 & avgTemp < 25 ~ "Mid",
+      avgTemp >= 25 ~ "High",
+      TRUE ~ "Unknown"
+    )
+  )
+print(stateAvgTemp, n=48)
+
+summary <- datMerged %>%
+  summarize(
+    NumberOfEntries = n(),
+    NumberOfNAEntries = sum(is.na(temp) | is.na(wind.sp) | is.na(atm.press)),
+    NumberOfStations = n_distinct(USAFID),
+    NumberOfStatesIncluded = n_distinct(STATE),
+    MeanTemperature = mean(temp, na.rm = TRUE),
+    MeanWindspeed = mean(wind.sp, na.rm = TRUE),
+    MeanAtmosphericPressure = mean(atm.press, na.rm = TRUE)
+  )
+print(summary)
+
+
+
+```
